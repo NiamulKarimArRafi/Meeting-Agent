@@ -1,0 +1,209 @@
+name: Build Meeting Agent APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate app
+        shell: bash
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/niamulkarim/meetingagent
+
+          cat > settings.gradle.kts <<'EOF'
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+rootProject.name = "MeetingAgent"
+include(":app")
+EOF
+
+          cat > build.gradle.kts <<'EOF'
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+}
+EOF
+
+          cat > gradle.properties <<'EOF'
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.niamulkarim.meetingagent"
+    compileSdk = 35
+    defaultConfig {
+        applicationId = "com.niamulkarim.meetingagent"
+        minSdk = 29
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
+    }
+}
+EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:theme="@android:style/Theme.Material.Light.NoActionBar" android:label="Meeting Agent" android:allowBackup="true">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+EOF
+
+          cat > app/src/main/java/com/niamulkarim/meetingagent/MainActivity.kt <<'EOF'
+package com.niamulkarim.meetingagent
+
+import android.Manifest
+import android.app.Activity
+import android.content.pm.PackageManager
+import android.media.MediaRecorder
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.InputType
+import android.view.View
+import android.widget.*
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
+
+class MainActivity : Activity() {
+    private lateinit var status: TextView
+    private lateinit var result: TextView
+    private lateinit var start: Button
+    private lateinit var stop: Button
+    private lateinit var groq: EditText
+    private lateinit var router: EditText
+    private var recorder: MediaRecorder? = null
+    private var recording = false
+    private var chunkNo = 0
+    private val chunks = mutableListOf<File>()
+    private val handler = Handler(Looper.getMainLooper())
+    private val executor = Executors.newSingleThreadExecutor()
+    private val rotate = object : Runnable {
+        override fun run() { if (recording) { nextChunk(); handler.postDelayed(this, 300_000L) } }
+    }
+
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32,32,32,32) }
+        val title = TextView(this).apply { text = "Meeting Agent"; textSize = 30f }
+        val sub = TextView(this).apply { text = "Bangla • English • Banglish\nLong meeting recorder + AI summary"; textSize = 16f; setPadding(0,8,0,20) }
+        groq = EditText(this).apply { hint = "Groq API key"; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
+        router = EditText(this).apply { hint = "OpenRouter API key"; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
+        val save = Button(this).apply { text = "Save API keys" }
+        start = Button(this).apply { text = "● START MEETING"; textSize = 18f }
+        stop = Button(this).apply { text = "STOP & SUMMARIZE"; isEnabled = false }
+        status = TextView(this).apply { text = "Ready."; setPadding(0,20,0,10) }
+        result = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
+        box.addView(title); box.addView(sub); box.addView(groq); box.addView(router); box.addView(save); box.addView(start); box.addView(stop); box.addView(status); box.addView(result)
+        setContentView(box)
+
+        val p = getSharedPreferences("keys", MODE_PRIVATE)
+        groq.setText(p.getString("groq", "")); router.setText(p.getString("router", ""))
+        save.setOnClickListener { p.edit().putString("groq",groq.text.toString().trim()).putString("router",router.text.toString().trim()).apply(); status.text="Keys saved." }
+        start.setOnClickListener { startMeeting() }
+        stop.setOnClickListener { stopMeeting() }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 10)
+    }
+
+    private fun startMeeting() {
+        if (groq.text.isBlank() || router.text.isBlank()) { status.text = "Enter and save both API keys first."; return }
+        chunks.clear(); chunkNo = 0; recording = true; start.isEnabled=false; stop.isEnabled=true; result.text=""; status.text="Recording… split into 5-minute chunks."; nextChunk(); handler.postDelayed(rotate,300_000L)
+    }
+
+    private fun nextChunk() {
+        if (!recording) return
+        try { recorder?.stop() } catch (_: Exception) {}
+        recorder?.release()
+        val f = File(cacheDir,"meeting_${System.currentTimeMillis()}_${chunkNo++}.m4a")
+        chunks.add(f)
+        recorder = MediaRecorder(this).apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC); setOutputFormat(MediaRecorder.OutputFormat.MPEG_4); setAudioEncoder(MediaRecorder.AudioEncoder.AAC); setAudioSamplingRate(44100); setAudioEncodingBitRate(128000); setOutputFile(f.absolutePath); prepare(); start()
+        }
+    }
+
+    private fun stopMeeting() {
+        if (!recording) return
+        recording=false; handler.removeCallbacks(rotate); try { recorder?.stop() } catch (_: Exception) {}; recorder?.release(); recorder=null; start.isEnabled=true; stop.isEnabled=false
+        val files=chunks.toList(); val g=groq.text.toString().trim(); val r=router.text.toString().trim()
+        executor.execute {
+            try {
+                val partials=StringBuilder()
+                files.forEachIndexed { i,f -> runOnUiThread { status.text="Transcribing ${i+1}/${files.size}…" }; val t=transcribe(f,g); runOnUiThread { status.text="Summarizing ${i+1}/${files.size}…" }; partials.append("\n--- Section ${i+1} ---\n").append(summarizeSection(t,r)).append("\n") }
+                runOnUiThread { status.text="Creating final meeting summary…" }
+                val final=summarizeFinal(partials.toString(),r)
+                runOnUiThread { status.text="Done."; result.text=final }
+            } catch(e:Exception) { runOnUiThread { status.text="Error: ${e.message}" } }
+            finally { files.forEach{it.delete()} }
+        }
+    }
+
+    private fun transcribe(file:File,key:String):String {
+        val boundary="----MA${System.currentTimeMillis()}"
+        val c=URL("https://api.groq.com/openai/v1/audio/transcriptions").openConnection() as HttpURLConnection
+        c.requestMethod="POST"; c.doOutput=true; c.setRequestProperty("Authorization","Bearer $key"); c.setRequestProperty("Content-Type","multipart/form-data; boundary=$boundary")
+        c.outputStream.use{o->
+            fun w(s:String)=o.write(s.toByteArray())
+            w("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n"); file.inputStream().use{it.copyTo(o)}; w("\r\n--$boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3\r\n--$boundary--\r\n")
+        }
+        return JSONObject(read(c)).optString("text")
+    }
+
+    private fun callRouter(prompt:String,key:String):String {
+        val body=JSONObject().put("model","openrouter/free").put("messages",JSONArray().put(JSONObject().put("role","user").put("content",prompt))).toString()
+        val c=URL("https://openrouter.ai/api/v1/chat/completions").openConnection() as HttpURLConnection
+        c.requestMethod="POST"; c.doOutput=true; c.setRequestProperty("Authorization","Bearer $key"); c.setRequestProperty("Content-Type","application/json"); c.outputStream.use{it.write(body.toByteArray())}
+        return JSONObject(read(c)).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
+    }
+
+    private fun summarizeSection(t:String,key:String)=callRouter("""Summarize this meeting section accurately. It may mix Bangla, English and Banglish. Do not invent. Extract key points, decisions and explicit action items.\n\nTRANSCRIPT:\n$t""",key)
+    private fun summarizeFinal(parts:String,key:String)=callRouter("""You are the final meeting analyst. Combine these section summaries into one coherent meeting record. Preserve meaning across Bangla, English and Banglish. Do not invent owners or deadlines. Return exactly: EXECUTIVE SUMMARY, KEY DISCUSSION, DECISIONS, ACTION ITEMS (OWNER / DEADLINE), OPEN QUESTIONS, RISKS/CONCERNS.\n\nSECTION SUMMARIES:\n$parts""",key)
+
+    private fun read(c:HttpURLConnection):String { val s=if(c.responseCode in 200..299)c.inputStream else c.errorStream; val x=s.bufferedReader().use{it.readText()}; if(c.responseCode !in 200..299) throw Exception("HTTP ${c.responseCode}: $x"); return x }
+    override fun onDestroy(){ recording=false; handler.removeCallbacksAndMessages(null); recorder?.release(); executor.shutdownNow(); super.onDestroy() }
+}
+EOF
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Meeting-Agent-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
