@@ -2,207 +2,47 @@ name: Build Meeting Agent APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/checkout@v6
+      - name: Setup Java
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Generate app
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.10.2'
+      - name: Generate Android project
         shell: bash
         run: |
           set -e
-          mkdir -p app/src/main/java/com/niamulkarim/meetingagent
-
-          cat > settings.gradle.kts <<'EOF'
-pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
-rootProject.name = "MeetingAgent"
-include(":app")
-EOF
-
-          cat > build.gradle.kts <<'EOF'
-plugins {
-    id("com.android.application") version "8.7.3" apply false
-    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
-}
-EOF
-
-          cat > gradle.properties <<'EOF'
-org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-android.useAndroidX=true
-kotlin.code.style=official
-EOF
-
-          cat > app/build.gradle.kts <<'EOF'
-plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-}
-
-android {
-    namespace = "com.niamulkarim.meetingagent"
-    compileSdk = 35
-    defaultConfig {
-        applicationId = "com.niamulkarim.meetingagent"
-        minSdk = 29
-        targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
-    }
-}
-EOF
-
-          cat > app/src/main/AndroidManifest.xml <<'EOF'
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.INTERNET" />
-    <application android:theme="@android:style/Theme.Material.Light.NoActionBar" android:label="Meeting Agent" android:allowBackup="true">
-        <activity android:name=".MainActivity" android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-EOF
-
-          cat > app/src/main/java/com/niamulkarim/meetingagent/MainActivity.kt <<'EOF'
-package com.niamulkarim.meetingagent
-
-import android.Manifest
-import android.app.Activity
-import android.content.pm.PackageManager
-import android.media.MediaRecorder
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.text.InputType
-import android.view.View
-import android.widget.*
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.Executors
-
-class MainActivity : Activity() {
-    private lateinit var status: TextView
-    private lateinit var result: TextView
-    private lateinit var start: Button
-    private lateinit var stop: Button
-    private lateinit var groq: EditText
-    private lateinit var router: EditText
-    private var recorder: MediaRecorder? = null
-    private var recording = false
-    private var chunkNo = 0
-    private val chunks = mutableListOf<File>()
-    private val handler = Handler(Looper.getMainLooper())
-    private val executor = Executors.newSingleThreadExecutor()
-    private val rotate = object : Runnable {
-        override fun run() { if (recording) { nextChunk(); handler.postDelayed(this, 300_000L) } }
-    }
-
-    override fun onCreate(b: Bundle?) {
-        super.onCreate(b)
-        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32,32,32,32) }
-        val title = TextView(this).apply { text = "Meeting Agent"; textSize = 30f }
-        val sub = TextView(this).apply { text = "Bangla • English • Banglish\nLong meeting recorder + AI summary"; textSize = 16f; setPadding(0,8,0,20) }
-        groq = EditText(this).apply { hint = "Groq API key"; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
-        router = EditText(this).apply { hint = "OpenRouter API key"; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
-        val save = Button(this).apply { text = "Save API keys" }
-        start = Button(this).apply { text = "● START MEETING"; textSize = 18f }
-        stop = Button(this).apply { text = "STOP & SUMMARIZE"; isEnabled = false }
-        status = TextView(this).apply { text = "Ready."; setPadding(0,20,0,10) }
-        result = TextView(this).apply { textSize = 16f; setTextIsSelectable(true) }
-        box.addView(title); box.addView(sub); box.addView(groq); box.addView(router); box.addView(save); box.addView(start); box.addView(stop); box.addView(status); box.addView(result)
-        setContentView(box)
-
-        val p = getSharedPreferences("keys", MODE_PRIVATE)
-        groq.setText(p.getString("groq", "")); router.setText(p.getString("router", ""))
-        save.setOnClickListener { p.edit().putString("groq",groq.text.toString().trim()).putString("router",router.text.toString().trim()).apply(); status.text="Keys saved." }
-        start.setOnClickListener { startMeeting() }
-        stop.setOnClickListener { stopMeeting() }
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 10)
-    }
-
-    private fun startMeeting() {
-        if (groq.text.isBlank() || router.text.isBlank()) { status.text = "Enter and save both API keys first."; return }
-        chunks.clear(); chunkNo = 0; recording = true; start.isEnabled=false; stop.isEnabled=true; result.text=""; status.text="Recording… split into 5-minute chunks."; nextChunk(); handler.postDelayed(rotate,300_000L)
-    }
-
-    private fun nextChunk() {
-        if (!recording) return
-        try { recorder?.stop() } catch (_: Exception) {}
-        recorder?.release()
-        val f = File(cacheDir,"meeting_${System.currentTimeMillis()}_${chunkNo++}.m4a")
-        chunks.add(f)
-        recorder = MediaRecorder(this).apply {
-            setAudioSource(MediaRecorder.AudioSource.MIC); setOutputFormat(MediaRecorder.OutputFormat.MPEG_4); setAudioEncoder(MediaRecorder.AudioEncoder.AAC); setAudioSamplingRate(44100); setAudioEncodingBitRate(128000); setOutputFile(f.absolutePath); prepare(); start()
-        }
-    }
-
-    private fun stopMeeting() {
-        if (!recording) return
-        recording=false; handler.removeCallbacks(rotate); try { recorder?.stop() } catch (_: Exception) {}; recorder?.release(); recorder=null; start.isEnabled=true; stop.isEnabled=false
-        val files=chunks.toList(); val g=groq.text.toString().trim(); val r=router.text.toString().trim()
-        executor.execute {
-            try {
-                val partials=StringBuilder()
-                files.forEachIndexed { i,f -> runOnUiThread { status.text="Transcribing ${i+1}/${files.size}…" }; val t=transcribe(f,g); runOnUiThread { status.text="Summarizing ${i+1}/${files.size}…" }; partials.append("\n--- Section ${i+1} ---\n").append(summarizeSection(t,r)).append("\n") }
-                runOnUiThread { status.text="Creating final meeting summary…" }
-                val final=summarizeFinal(partials.toString(),r)
-                runOnUiThread { status.text="Done."; result.text=final }
-            } catch(e:Exception) { runOnUiThread { status.text="Error: ${e.message}" } }
-            finally { files.forEach{it.delete()} }
-        }
-    }
-
-    private fun transcribe(file:File,key:String):String {
-        val boundary="----MA${System.currentTimeMillis()}"
-        val c=URL("https://api.groq.com/openai/v1/audio/transcriptions").openConnection() as HttpURLConnection
-        c.requestMethod="POST"; c.doOutput=true; c.setRequestProperty("Authorization","Bearer $key"); c.setRequestProperty("Content-Type","multipart/form-data; boundary=$boundary")
-        c.outputStream.use{o->
-            fun w(s:String)=o.write(s.toByteArray())
-            w("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n"); file.inputStream().use{it.copyTo(o)}; w("\r\n--$boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3\r\n--$boundary--\r\n")
-        }
-        return JSONObject(read(c)).optString("text")
-    }
-
-    private fun callRouter(prompt:String,key:String):String {
-        val body=JSONObject().put("model","openrouter/free").put("messages",JSONArray().put(JSONObject().put("role","user").put("content",prompt))).toString()
-        val c=URL("https://openrouter.ai/api/v1/chat/completions").openConnection() as HttpURLConnection
-        c.requestMethod="POST"; c.doOutput=true; c.setRequestProperty("Authorization","Bearer $key"); c.setRequestProperty("Content-Type","application/json"); c.outputStream.use{it.write(body.toByteArray())}
-        return JSONObject(read(c)).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content")
-    }
-
-    private fun summarizeSection(t:String,key:String)=callRouter("""Summarize this meeting section accurately. It may mix Bangla, English and Banglish. Do not invent. Extract key points, decisions and explicit action items.\n\nTRANSCRIPT:\n$t""",key)
-    private fun summarizeFinal(parts:String,key:String)=callRouter("""You are the final meeting analyst. Combine these section summaries into one coherent meeting record. Preserve meaning across Bangla, English and Banglish. Do not invent owners or deadlines. Return exactly: EXECUTIVE SUMMARY, KEY DISCUSSION, DECISIONS, ACTION ITEMS (OWNER / DEADLINE), OPEN QUESTIONS, RISKS/CONCERNS.\n\nSECTION SUMMARIES:\n$parts""",key)
-
-    private fun read(c:HttpURLConnection):String { val s=if(c.responseCode in 200..299)c.inputStream else c.errorStream; val x=s.bufferedReader().use{it.readText()}; if(c.responseCode !in 200..299) throw Exception("HTTP ${c.responseCode}: $x"); return x }
-    override fun onDestroy(){ recording=false; handler.removeCallbacksAndMessages(null); recorder?.release(); executor.shutdownNow(); super.onDestroy() }
-}
-EOF
-
-      - name: Build APK
-        run: gradle :app:assembleDebug --no-daemon
-
-      - name: Upload APK artifact
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          printf '%s' 'cGx1Z2luTWFuYWdlbWVudCB7IHJlcG9zaXRvcmllcyB7IGdvb2dsZSgpOyBtYXZlbkNlbnRyYWwoKTsgZ3JhZGxlUGx1Z2luUG9ydGFsKCkgfSB9CmRlcGVuZGVuY3lSZXNvbHV0aW9uTWFuYWdlbWVudCB7IHJlcG9zaXRvcmllc01vZGUuc2V0KFJlcG9zaXRvcmllc01vZGUuRkFJTF9PTl9QUk9KRUNUX1JFUE9TKTsgcmVwb3NpdG9yaWVzIHsgZ29vZ2xlKCk7IG1hdmVuQ2VudHJhbCgpIH0gfQpyb290UHJvamVjdC5uYW1lPSJNZWV0aW5nQWdlbnQiCmluY2x1ZGUoIjphcHAiKQo=' | base64 -d > 'settings.gradle.kts'
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          printf '%s' 'cGx1Z2lucyB7IGlkKCJjb20uYW5kcm9pZC5hcHBsaWNhdGlvbiIpIHZlcnNpb24gIjguNy4zIiBhcHBseSBmYWxzZSB9Cg==' | base64 -d > 'build.gradle.kts'
+          mkdir -p "$(dirname 'gradle.properties')"
+          printf '%s' 'b3JnLmdyYWRsZS5qdm1hcmdzPS1YbXgyMDQ4bSAtRGZpbGUuZW5jb2Rpbmc9VVRGLTgKYW5kcm9pZC51c2VBbmRyb2lkWD10cnVlCg==' | base64 -d > 'gradle.properties'
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          printf '%s' 'cGx1Z2lucyB7IGlkKCJjb20uYW5kcm9pZC5hcHBsaWNhdGlvbiIpIH0KYW5kcm9pZCB7IG5hbWVzcGFjZT0iY29tLm5pYW11bGthcmltLm1lZXRpbmdhZ2VudCI7IGNvbXBpbGVTZGs9MzUKICAgIGRlZmF1bHRDb25maWcgeyBhcHBsaWNhdGlvbklkPSJjb20ubmlhbXVsa2FyaW0ubWVldGluZ2FnZW50IjsgbWluU2RrPTI5OyB0YXJnZXRTZGs9MzU7IHZlcnNpb25Db2RlPTE7IHZlcnNpb25OYW1lPSIxLjAiIH0KfQo=' | base64 -d > 'app/build.gradle.kts'
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          printf '%s' 'PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPG1hbmlmZXN0IHhtbG5zOmFuZHJvaWQ9Imh0dHA6Ly9zY2hlbWFzLmFuZHJvaWQuY29tL2Fway9yZXMvYW5kcm9pZCI+Cjx1c2VzLXBlcm1pc3Npb24gYW5kcm9pZDpuYW1lPSJhbmRyb2lkLnBlcm1pc3Npb24uUkVDT1JEX0FVRElPIi8+PHVzZXMtcGVybWlzc2lvbiBhbmRyb2lkOm5hbWU9ImFuZHJvaWQucGVybWlzc2lvbi5JTlRFUk5FVCIvPgo8YXBwbGljYXRpb24gYW5kcm9pZDphbGxvd0JhY2t1cD0idHJ1ZSIgYW5kcm9pZDpsYWJlbD0iTWVldGluZyBBZ2VudCIgYW5kcm9pZDp0aGVtZT0iQHN0eWxlL1RoZW1lLk1lZXRpbmdBZ2VudCI+CjxhY3Rpdml0eSBhbmRyb2lkOm5hbWU9Ii5NYWluQWN0aXZpdHkiIGFuZHJvaWQ6ZXhwb3J0ZWQ9InRydWUiPjxpbnRlbnQtZmlsdGVyPjxhY3Rpb24gYW5kcm9pZDpuYW1lPSJhbmRyb2lkLmludGVudC5hY3Rpb24uTUFJTiIvPjxjYXRlZ29yeSBhbmRyb2lkOm5hbWU9ImFuZHJvaWQuaW50ZW50LmNhdGVnb3J5LkxBVU5DSEVSIi8+PC9pbnRlbnQtZmlsdGVyPjwvYWN0aXZpdHk+CjwvYXBwbGljYXRpb24+PC9tYW5pZmVzdD4K' | base64 -d > 'app/src/main/AndroidManifest.xml'
+          mkdir -p "$(dirname 'app/src/main/res/values/styles.xml')"
+          printf '%s' 'PHJlc291cmNlcz48c3R5bGUgbmFtZT0iVGhlbWUuTWVldGluZ0FnZW50IiBwYXJlbnQ9IkBhbmRyb2lkOnN0eWxlL1RoZW1lLk1hdGVyaWFsLkxpZ2h0Lk5vQWN0aW9uQmFyIj48aXRlbSBuYW1lPSJhbmRyb2lkOmZvbnRGYW1pbHkiPnNhbnM8L2l0ZW0+PGl0ZW0gbmFtZT0iYW5kcm9pZDpjb2xvckFjY2VudCI+IzY3NTBBNDwvaXRlbT48L3N0eWxlPjwvcmVzb3VyY2VzPgo=' | base64 -d > 'app/src/main/res/values/styles.xml'
+          mkdir -p "$(dirname 'app/src/main/java/com/niamulkarim/meetingagent/MainActivity.java')"
+          printf '%s' 'cGFja2FnZSBjb20ubmlhbXVsa2FyaW0ubWVldGluZ2FnZW50OwoKaW1wb3J0IGFuZHJvaWQuTWFuaWZlc3Q7IGltcG9ydCBhbmRyb2lkLmFwcC5BY3Rpdml0eTsgaW1wb3J0IGFuZHJvaWQuY29udGVudC5wbS5QYWNrYWdlTWFuYWdlcjsgaW1wb3J0IGFuZHJvaWQubWVkaWEuTWVkaWFSZWNvcmRlcjsgaW1wb3J0IGFuZHJvaWQub3MuKjsgaW1wb3J0IGFuZHJvaWQudmlldy4qOyBpbXBvcnQgYW5kcm9pZC53aWRnZXQuKjsgaW1wb3J0IG9yZy5qc29uLio7IGltcG9ydCBqYXZhLmlvLio7IGltcG9ydCBqYXZhLm5ldC4qOyBpbXBvcnQgamF2YS51dGlsLio7IGltcG9ydCBqYXZhLnV0aWwuY29uY3VycmVudC4qOwoKcHVibGljIGNsYXNzIE1haW5BY3Rpdml0eSBleHRlbmRzIEFjdGl2aXR5IHsKIEVkaXRUZXh0IGdyb3Escm91dGVyOyBUZXh0VmlldyBzdGF0dXMscmVzdWx0OyBCdXR0b24gc3RhcnQsc3RvcDsgTWVkaWFSZWNvcmRlciByZWM7IGJvb2xlYW4gcmVjb3JkaW5nPWZhbHNlOyBpbnQgaWR4PTA7IExpc3Q8RmlsZT4gY2h1bmtzPW5ldyBBcnJheUxpc3Q8PigpOyBIYW5kbGVyIGg9bmV3IEhhbmRsZXIoTG9vcGVyLmdldE1haW5Mb29wZXIoKSk7IEV4ZWN1dG9yU2VydmljZSBleD1FeGVjdXRvcnMubmV3U2luZ2xlVGhyZWFkRXhlY3V0b3IoKTsKIFJ1bm5hYmxlIHJvdGF0ZT0oKS0+e2lmKHJlY29yZGluZyl7dHJ5e3JlYy5zdG9wKCk7cmVjLnJlbGVhc2UoKTt9Y2F0Y2goRXhjZXB0aW9uIGUpe30gcmVjPW51bGw7IHN0YXJ0Q2h1bmsoKTsgaC5wb3N0RGVsYXllZChyb3RhdGUsMzAwMDAwKTt9fTsKIEBPdmVycmlkZSBwdWJsaWMgdm9pZCBvbkNyZWF0ZShCdW5kbGUgYil7c3VwZXIub25DcmVhdGUoYik7IHNldENvbnRlbnRWaWV3KHVpKCkpOyBpZihjaGVja1NlbGZQZXJtaXNzaW9uKE1hbmlmZXN0LnBlcm1pc3Npb24uUkVDT1JEX0FVRElPKSE9UGFja2FnZU1hbmFnZXIuUEVSTUlTU0lPTl9HUkFOVEVEKXJlcXVlc3RQZXJtaXNzaW9ucyhuZXcgU3RyaW5nW117TWFuaWZlc3QucGVybWlzc2lvbi5SRUNPUkRfQVVESU99LDEwKTt9CiBWaWV3IHVpKCl7TGluZWFyTGF5b3V0IGw9bmV3IExpbmVhckxheW91dCh0aGlzKTtsLnNldE9yaWVudGF0aW9uKExpbmVhckxheW91dC5WRVJUSUNBTCk7bC5zZXRQYWRkaW5nKDI0LDI0LDI0LDI0KTsgVGV4dFZpZXcgdD1uZXcgVGV4dFZpZXcodGhpcyk7dC5zZXRUZXh0KCJNZWV0aW5nIEFnZW50Iik7dC5zZXRUZXh0U2l6ZSgzMCk7dC5zZXRUeXBlZmFjZShudWxsLDEpO2wuYWRkVmlldyh0KTtUZXh0VmlldyBzPW5ldyBUZXh0Vmlldyh0aGlzKTtzLnNldFRleHQoIkJhbmdsYSDigKIgRW5nbGlzaCDigKIgQmFuZ2xpc2hcbkxvbmctbWVldGluZyByZWNvcmRlciArIEFJIHN1bW1hcnkiKTtzLnNldFRleHRTaXplKDE2KTtsLmFkZFZpZXcocyk7CiBncm9xPW5ldyBFZGl0VGV4dCh0aGlzKTtncm9xLnNldEhpbnQoIkdyb3EgQVBJIGtleSIpO2dyb3Euc2V0SW5wdXRUeXBlKDEyOSk7bC5hZGRWaWV3KGdyb3EpO3JvdXRlcj1uZXcgRWRpdFRleHQodGhpcyk7cm91dGVyLnNldEhpbnQoIk9wZW5Sb3V0ZXIgQVBJIGtleSIpO3JvdXRlci5zZXRJbnB1dFR5cGUoMTI5KTtsLmFkZFZpZXcocm91dGVyKTtCdXR0b24gc2F2ZT1uZXcgQnV0dG9uKHRoaXMpO3NhdmUuc2V0VGV4dCgiU2F2ZSBBUEkga2V5cyIpO2wuYWRkVmlldyhzYXZlKTtzdGFydD1uZXcgQnV0dG9uKHRoaXMpO3N0YXJ0LnNldFRleHQoIlNUQVJUIE1FRVRJTkciKTtsLmFkZFZpZXcoc3RhcnQpO3N0b3A9bmV3IEJ1dHRvbih0aGlzKTtzdG9wLnNldFRleHQoIlNUT1AgJiBTVU1NQVJJWkUiKTtzdG9wLnNldEVuYWJsZWQoZmFsc2UpO2wuYWRkVmlldyhzdG9wKTtQcm9ncmVzc0JhciBwPW5ldyBQcm9ncmVzc0Jhcih0aGlzKTtwLnNldFZpc2liaWxpdHkoVmlldy5HT05FKTtsLmFkZFZpZXcocCk7c3RhdHVzPW5ldyBUZXh0Vmlldyh0aGlzKTtzdGF0dXMuc2V0VGV4dCgiUmVhZHkuIik7bC5hZGRWaWV3KHN0YXR1cyk7cmVzdWx0PW5ldyBUZXh0Vmlldyh0aGlzKTtyZXN1bHQuc2V0VGV4dElzU2VsZWN0YWJsZSh0cnVlKTtsLmFkZFZpZXcocmVzdWx0KTsKIHNhdmUuc2V0T25DbGlja0xpc3RlbmVyKHYtPmdldFByZWZlcmVuY2VzKDApLmVkaXQoKS5wdXRTdHJpbmcoImciLGdyb3EuZ2V0VGV4dCgpLnRvU3RyaW5nKCkudHJpbSgpKS5wdXRTdHJpbmcoInIiLHJvdXRlci5nZXRUZXh0KCkudG9TdHJpbmcoKS50cmltKCkpLmFwcGx5KCkpO2dyb3Euc2V0VGV4dChnZXRQcmVmZXJlbmNlcygwKS5nZXRTdHJpbmcoImciLCIiKSk7cm91dGVyLnNldFRleHQoZ2V0UHJlZmVyZW5jZXMoMCkuZ2V0U3RyaW5nKCJyIiwiIikpO3N0YXJ0LnNldE9uQ2xpY2tMaXN0ZW5lcih2LT5zdGFydE1lZXRpbmcoKSk7c3RvcC5zZXRPbkNsaWNrTGlzdGVuZXIodi0+c3RvcE1lZXRpbmcoKSk7cmV0dXJuIGw7fQogdm9pZCBzdGFydE1lZXRpbmcoKXtpZihncm9xLmdldFRleHQoKS5sZW5ndGgoKT09MHx8cm91dGVyLmdldFRleHQoKS5sZW5ndGgoKT09MCl7c3RhdHVzLnNldFRleHQoIkVudGVyIGJvdGggQVBJIGtleXMuIik7cmV0dXJuO31jaHVua3MuY2xlYXIoKTtpZHg9MDtyZWNvcmRpbmc9dHJ1ZTtzdGFydC5zZXRFbmFibGVkKGZhbHNlKTtzdG9wLnNldEVuYWJsZWQodHJ1ZSk7c3RhdHVzLnNldFRleHQoIlJlY29yZGluZ+KApiIpO3N0YXJ0Q2h1bmsoKTtoLnBvc3REZWxheWVkKHJvdGF0ZSwzMDAwMDApO30KIHZvaWQgc3RhcnRDaHVuaygpe0ZpbGUgZj1uZXcgRmlsZShnZXRDYWNoZURpcigpLCJjaHVua18iK1N5c3RlbS5jdXJyZW50VGltZU1pbGxpcygpKyJfIitpZHgrKysiLm00YSIpO2NodW5rcy5hZGQoZik7cmVjPW5ldyBNZWRpYVJlY29yZGVyKCk7cmVjLnNldEF1ZGlvU291cmNlKE1lZGlhUmVjb3JkZXIuQXVkaW9Tb3VyY2UuTUlDKTtyZWMuc2V0T3V0cHV0Rm9ybWF0KE1lZGlhUmVjb3JkZXIuT3V0cHV0Rm9ybWF0Lk1QRUdfNCk7cmVjLnNldEF1ZGlvRW5jb2RlcihNZWRpYVJlY29yZGVyLkF1ZGlvRW5jb2Rlci5BQUMpO3JlYy5zZXRPdXRwdXRGaWxlKGYuZ2V0QWJzb2x1dGVQYXRoKCkpO3RyeXtyZWMucHJlcGFyZSgpO3JlYy5zdGFydCgpO31jYXRjaChFeGNlcHRpb24gZSl7c3RhdHVzLnNldFRleHQoIlJlY29yZGluZyBlcnJvcjogIitlLmdldE1lc3NhZ2UoKSk7fX0KIHZvaWQgc3RvcE1lZXRpbmcoKXtpZighcmVjb3JkaW5nKXJldHVybjtyZWNvcmRpbmc9ZmFsc2U7aC5yZW1vdmVDYWxsYmFja3Mocm90YXRlKTt0cnl7cmVjLnN0b3AoKTtyZWMucmVsZWFzZSgpO31jYXRjaChFeGNlcHRpb24gZSl7fXJlYz1udWxsO3N0YXJ0LnNldEVuYWJsZWQodHJ1ZSk7c3RvcC5zZXRFbmFibGVkKGZhbHNlKTtzdGF0dXMuc2V0VGV4dCgiUHJvY2Vzc2luZ+KApiIpO0xpc3Q8RmlsZT4gZnM9bmV3IEFycmF5TGlzdDw+KGNodW5rcyk7U3RyaW5nIGc9Z3JvcS5nZXRUZXh0KCkudG9TdHJpbmcoKS50cmltKCkscj1yb3V0ZXIuZ2V0VGV4dCgpLnRvU3RyaW5nKCkudHJpbSgpO2V4LmV4ZWN1dGUoKCktPnt0cnl7U3RyaW5nQnVpbGRlciB0cj1uZXcgU3RyaW5nQnVpbGRlcigpO2ZvcihGaWxlIGY6ZnMpdHIuYXBwZW5kKHRyYW5zY3JpYmUoZixnKSkuYXBwZW5kKCJcbiIpO3J1bk9uVWlUaHJlYWQoKCktPnN0YXR1cy5zZXRUZXh0KCJTdW1tYXJpemluZ+KApiIpKTtTdHJpbmcgc3VtPXN1bW1hcml6ZSh0ci50b1N0cmluZygpLHIpO3J1bk9uVWlUaHJlYWQoKCktPntzdGF0dXMuc2V0VGV4dCgiRG9uZS4iKTtyZXN1bHQuc2V0VGV4dChzdW0pO30pO31jYXRjaChFeGNlcHRpb24gZSl7cnVuT25VaVRocmVhZCgoKS0+c3RhdHVzLnNldFRleHQoIkVycm9yOiAiK2UuZ2V0TWVzc2FnZSgpKSk7fWZpbmFsbHl7Zm9yKEZpbGUgZjpmcylmLmRlbGV0ZSgpO319KTt9CiBTdHJpbmcgdHJhbnNjcmliZShGaWxlIGYsU3RyaW5nIGtleSl0aHJvd3MgRXhjZXB0aW9ue1N0cmluZyBiPSItLS0tTUEiK1N5c3RlbS5jdXJyZW50VGltZU1pbGxpcygpO0h0dHBVUkxDb25uZWN0aW9uIGM9KEh0dHBVUkxDb25uZWN0aW9uKW5ldyBVUkwoImh0dHBzOi8vYXBpLmdyb3EuY29tL29wZW5haS92MS9hdWRpby90cmFuc2NyaXB0aW9ucyIpLm9wZW5Db25uZWN0aW9uKCk7Yy5zZXRSZXF1ZXN0TWV0aG9kKCJQT1NUIik7Yy5zZXREb091dHB1dCh0cnVlKTtjLnNldFJlcXVlc3RQcm9wZXJ0eSgiQXV0aG9yaXphdGlvbiIsIkJlYXJlciAiK2tleSk7Yy5zZXRSZXF1ZXN0UHJvcGVydHkoIkNvbnRlbnQtVHlwZSIsIm11bHRpcGFydC9mb3JtLWRhdGE7IGJvdW5kYXJ5PSIrYik7dHJ5KE91dHB1dFN0cmVhbSBvPWMuZ2V0T3V0cHV0U3RyZWFtKCkpe3cobywiLS0iK2IrIlxyXG5Db250ZW50LURpc3Bvc2l0aW9uOiBmb3JtLWRhdGE7IG5hbWU9XCJmaWxlXCI7IGZpbGVuYW1lPVwiYS5tNGFcIlxyXG5Db250ZW50LVR5cGU6IGF1ZGlvL21wNFxyXG5cclxuIik7dHJ5KElucHV0U3RyZWFtIGluPW5ldyBGaWxlSW5wdXRTdHJlYW0oZikpe2luLnRyYW5zZmVyVG8obyk7fXcobywiXHJcbi0tIitiKyJcclxuQ29udGVudC1EaXNwb3NpdGlvbjogZm9ybS1kYXRhOyBuYW1lPVwibW9kZWxcIlxyXG5cclxud2hpc3Blci1sYXJnZS12M1xyXG4tLSIrYisiLS1cclxuIik7fXJldHVybiBuZXcgSlNPTk9iamVjdChyZXNwKGMpKS5vcHRTdHJpbmcoInRleHQiLCIiKTt9CiBTdHJpbmcgc3VtbWFyaXplKFN0cmluZyB0LFN0cmluZyBrZXkpdGhyb3dzIEV4Y2VwdGlvbntTdHJpbmcgcHJvbXB0PSJTdW1tYXJpemUgdGhpcyBCYW5nbGEvRW5nbGlzaC9CYW5nbGlzaCBtZWV0aW5nLiBSZXR1cm4gRXhlY3V0aXZlIFN1bW1hcnksIERlY2lzaW9ucywgQWN0aW9uIEl0ZW1zIHdpdGggb3duZXJzL2RlYWRsaW5lcywgT3BlbiBRdWVzdGlvbnMsIFJpc2tzLiBEbyBub3QgaW52ZW50IGZhY3RzLlxuXG4iK3Q7SlNPTk9iamVjdCBib2R5PW5ldyBKU09OT2JqZWN0KCkucHV0KCJtb2RlbCIsIm9wZW5yb3V0ZXIvZnJlZSIpLnB1dCgibWVzc2FnZXMiLG5ldyBKU09OQXJyYXkoKS5wdXQobmV3IEpTT05PYmplY3QoKS5wdXQoInJvbGUiLCJ1c2VyIikucHV0KCJjb250ZW50Iixwcm9tcHQpKSk7SHR0cFVSTENvbm5lY3Rpb24gYz0oSHR0cFVSTENvbm5lY3Rpb24pbmV3IFVSTCgiaHR0cHM6Ly9vcGVucm91dGVyLmFpL2FwaS92MS9jaGF0L2NvbXBsZXRpb25zIikub3BlbkNvbm5lY3Rpb24oKTtjLnNldFJlcXVlc3RNZXRob2QoIlBPU1QiKTtjLnNldERvT3V0cHV0KHRydWUpO2Muc2V0UmVxdWVzdFByb3BlcnR5KCJBdXRob3JpemF0aW9uIiwiQmVhcmVyICIra2V5KTtjLnNldFJlcXVlc3RQcm9wZXJ0eSgiQ29udGVudC1UeXBlIiwiYXBwbGljYXRpb24vanNvbiIpO3RyeShPdXRwdXRTdHJlYW0gbz1jLmdldE91dHB1dFN0cmVhbSgpKXtvLndyaXRlKGJvZHkudG9TdHJpbmcoKS5nZXRCeXRlcygiVVRGLTgiKSk7fXJldHVybiBuZXcgSlNPTk9iamVjdChyZXNwKGMpKS5nZXRKU09OQXJyYXkoImNob2ljZXMiKS5nZXRKU09OT2JqZWN0KDApLmdldEpTT05PYmplY3QoIm1lc3NhZ2UiKS5nZXRTdHJpbmcoImNvbnRlbnQiKTt9CiB2b2lkIHcoT3V0cHV0U3RyZWFtIG8sU3RyaW5nIHMpdGhyb3dzIEV4Y2VwdGlvbntvLndyaXRlKHMuZ2V0Qnl0ZXMoIlVURi04IikpO30gU3RyaW5nIHJlc3AoSHR0cFVSTENvbm5lY3Rpb24gYyl0aHJvd3MgRXhjZXB0aW9ue0lucHV0U3RyZWFtIHM9Yy5nZXRSZXNwb25zZUNvZGUoKTwzMDA/Yy5nZXRJbnB1dFN0cmVhbSgpOmMuZ2V0RXJyb3JTdHJlYW0oKTtTdHJpbmcgeD1uZXcgQnVmZmVyZWRSZWFkZXIobmV3IElucHV0U3RyZWFtUmVhZGVyKHMsIlVURi04IikpLmxpbmVzKCkucmVkdWNlKCIiLChhLHopLT5hK3orIlxuIik7aWYoYy5nZXRSZXNwb25zZUNvZGUoKT49MzAwKXRocm93IG5ldyBFeGNlcHRpb24oIkhUVFAgIitjLmdldFJlc3BvbnNlQ29kZSgpKyI6ICIreCk7cmV0dXJuIHg7fQogQE92ZXJyaWRlIHByb3RlY3RlZCB2b2lkIG9uRGVzdHJveSgpe3JlY29yZGluZz1mYWxzZTtoLnJlbW92ZUNhbGxiYWNrc0FuZE1lc3NhZ2VzKG51bGwpO3RyeXtpZihyZWMhPW51bGwpcmVjLnJlbGVhc2UoKTt9Y2F0Y2goRXhjZXB0aW9uIGUpe31leC5zaHV0ZG93bk5vdygpO3N1cGVyLm9uRGVzdHJveSgpO30KfQo=' | base64 -d > 'app/src/main/java/com/niamulkarim/meetingagent/MainActivity.java'
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Meeting-Agent-debug-apk
